@@ -508,30 +508,43 @@ retire_qylock_waiter() {
 }
 
 schedule_qylock_cutover() {
-  local waiter=$self_path
-  # A package transaction removes its /run executor after the user cutover
-  # returns. The deferred unit must therefore enter through the installed path,
-  # which remains valid for its retries after the transaction has finished.
-  [[ -x $installed_helper ]] && waiter=$installed_helper
+  # A deferred unit cannot use the /run executable: the package hook removes
+  # it when the transaction finishes. Check before retiring any prior waiter.
+  if [[ ! -x $installed_helper ]]; then
+    log "cannot defer qylock cutover: installed helper $installed_helper is unavailable" >&2
+    return 1
+  fi
   retire_qylock_waiter
   if [[ $init_system == systemd ]]; then
     systemd-run --user --quiet --collect --unit="$qylock_cutover_wait_unit" \
       --property=Type=exec --property=TimeoutStopSec=5s \
-      --property=Restart=on-failure --property=RestartSec=2s \
-      "$waiter" wait-qylock
+      --property=Restart=no \
+      "$installed_helper" wait-qylock
   else
-    runit_transient_start "$qylock_cutover_wait_unit" -- "$waiter" wait-qylock
+    runit_transient_start "$qylock_cutover_wait_unit" -- "$installed_helper" wait-qylock
   fi
+}
+
+# A waiter may fail before entering user_cutover (so that function's EXIT trap
+# never ran). Both guard cleanups must be attempted, even if one fails. The
+# caller still returns failure; a closing session keeps its block.
+cleanup_failed_qylock_waiter() {
+  local rc=0
+  release_qylock_guards || { log "qylock guard cleanup failed" >&2 || :; rc=1; }
+  if ! user_guard_session_closing; then
+    release_user_guard || { log "sleep guard cleanup failed" >&2 || :; rc=1; }
+  fi
+  return "$rc"
 }
 
 wait_qylock_cutover() {
   local rc attempt=0
-  ensure_qylock_generation_guard || return 1
-  # Every attempt stops and re-reaches the session target, so a persistent
-  # failure must not become a restart loop that burns the desktop (#275):
-  # three attempts with backoff, then leave the running session untouched and
-  # say exactly what to run by hand. systemd's own start limit stays in place
-  # as the backstop for the transient unit (StartLimitIntervalSec=0 removed it).
+  if ! ensure_qylock_generation_guard; then
+    cleanup_failed_qylock_waiter || :
+    return 1
+  fi
+  # Every attempt can disrupt the desktop. Give up after three attempts;
+  # systemd must not restart the waiter and reset this counter.
   while (( ++attempt <= 3 )); do
     rc=0
     RYOKU_QYLOCK_WAITER=1 "$self_path" user || rc=$?
@@ -539,7 +552,7 @@ wait_qylock_cutover() {
     log "qylock cutover attempt $attempt of 3 failed (exit $rc)" >&2
     (( attempt < 3 )) && sleep $(( attempt * 2 ))
   done
-  release_qylock_guards
+  cleanup_failed_qylock_waiter || :
   log "qylock cutover gave up after 3 attempts; the running session was left untouched. Retry by hand with: ryoku-power-cutover user" >&2
   return 1
 }

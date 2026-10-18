@@ -467,6 +467,9 @@ cat >"$tmp/bin/fake" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 name="$(basename "$0")"
+if [[ $name == ryoku-reload-cover ]]; then
+  exit 0
+fi
 if [[ ${RYOKU_TEST_INIT:-systemd} == runit ]]; then
   case "$name" in
     systemctl|systemd-run|systemd-inhibit|systemd-escape)
@@ -574,6 +577,9 @@ if [[ $name == systemd-run ]]; then
     printf 'systemd-run qylock-wait\n' >>"$CUTOVER_LOG"
     if [[ -n ${QYLOCK_WAITER_PATH_LOG:-} ]]; then
       printf '%s\n' "${*: -2:1}" >"$QYLOCK_WAITER_PATH_LOG"
+    fi
+    if [[ -n ${QYLOCK_WAITER_ARGS_LOG:-} ]]; then
+      printf '%s\n' "$*" >"$QYLOCK_WAITER_ARGS_LOG"
     fi
   elif [[ $* == *ryoku-idle*" start" ]]; then
     printf 'systemd-run idle-daemon\n' >>"$CUTOVER_LOG"
@@ -713,7 +719,8 @@ fi
 EOF
 chmod +x "$tmp/bin/fake" "$tmp/bin/pgrep" "$tmp/qylock-install" \
   "$tmp/qylock-lock" "$tmp/qylock-proof" "$tmp/bin/ryoku-wm-testwm"
-for name in ryoku ryoku-shell ryoku-idle ryoku-clamshell systemctl systemd-run systemd-inhibit elogind-inhibit loginctl dbus-monitor sv; do
+for name in ryoku ryoku-shell ryoku-idle ryoku-clamshell ryoku-reload-cover \
+  systemctl systemd-run systemd-inhibit elogind-inhibit loginctl dbus-monitor sv; do
   ln -s fake "$tmp/bin/$name"
 done
 ln -s "$tmp/ryoku-host" "$tmp/bin/ryoku-host"
@@ -732,6 +739,7 @@ cp "$helper" "$tmp/installed-cutover-helper"
 chmod +x "$tmp/staged-cutover-helper" "$tmp/installed-cutover-helper"
 : >"$tmp/calls"
 QYLOCK_WAITER_PATH_LOG="$tmp/qylock-waiter-path" \
+  QYLOCK_WAITER_ARGS_LOG="$tmp/qylock-waiter-args" \
   CUTOVER_LOG="$tmp/calls" CUTOVER_STATE="$tmp/state" \
   RYOKU_CUTOVER_RUNTIME_HELPER="$tmp/staged-cutover-helper" \
   RYOKU_CUTOVER_INSTALLED_HELPER="$tmp/installed-cutover-helper" \
@@ -743,6 +751,62 @@ grep -qxF \
   'systemctl --user stop ryoku-qylock-cutover-wait.service' "$tmp/calls" ||
   fail "deferred qylock cutover did not replace the previous waiter"
 
+# A transient must not launch new retries after the script gives up.
+grep -qF -- '--property=Restart=no' "$tmp/qylock-waiter-args" ||
+  fail "systemd would restart the bounded waiter"
+# Simulate post-transaction cleanup: the selected executable must survive.
+rm -f "$tmp/staged-cutover-helper"
+[[ -x $(<"$tmp/qylock-waiter-path") ]] ||
+  fail "scheduled qylock executable vanished with the staging helper"
+
+# A missing installed helper must not stop the old waiter or schedule /run.
+: >"$tmp/calls"
+if CUTOVER_LOG="$tmp/calls" CUTOVER_STATE="$tmp/state" \
+    RYOKU_CUTOVER_RUNTIME_HELPER="$tmp/staged-cutover-helper" \
+    RYOKU_CUTOVER_INSTALLED_HELPER="$tmp/missing-installed-helper" \
+    PATH="$tmp/bin:$PATH" \
+    bash -c 'source "$1"; schedule_qylock_cutover' _ "$helper" \
+    >"$tmp/missing-helper.log" 2>&1; then
+  fail "deferred a missing installed helper"
+fi
+if grep -qE '^(systemctl --user stop ryoku-qylock-cutover-wait|systemd-run qylock-wait)' "$tmp/calls"; then
+  fail "missing installed helper disturbed the existing waiter"
+fi
+
+# Both guards must get cleanup on final failure (and on guard acquisition
+# failure), even if the first cleanup reports an error. The protected closing
+# session keeps its sleep block until the user manager goes away.
+for acquire_failed in 0 1; do
+  for closing in 0 1; do
+    : >"$tmp/calls"
+    if CUTOVER_LOG="$tmp/calls" CUTOVER_STATE="$tmp/state" \
+        WAITER_ACQUIRE_FAILED="$acquire_failed" WAITER_SESSION_CLOSING="$closing" \
+        PATH="$tmp/bin:$PATH" bash -c '
+          source "$1"
+          self_path="$CUTOVER_STATE/no-such-waiter-executable"
+          ensure_qylock_generation_guard() { [[ $WAITER_ACQUIRE_FAILED == 0 ]]; }
+          release_qylock_guards() { echo guards-released >>"$CUTOVER_LOG"; return 73; }
+          user_guard_session_closing() { [[ $WAITER_SESSION_CLOSING == 1 ]]; }
+          release_user_guard() { echo user-guard-released >>"$CUTOVER_LOG"; }
+          sleep() { :; }
+          wait_qylock_cutover
+        ' _ "$helper" >"$tmp/waiter-failure.log" 2>&1; then
+      fail "failed deferred waiter reported success"
+    fi
+    grep -qxF guards-released "$tmp/calls" ||
+      fail "deferred failure skipped qylock cleanup"
+    if [[ $closing == 0 ]]; then
+      grep -qxF user-guard-released "$tmp/calls" ||
+        fail "deferred failure stranded its sleep guard"
+    elif grep -qxF user-guard-released "$tmp/calls"; then
+      fail "closing session prematurely dropped its sleep guard"
+    fi
+    if [[ $acquire_failed == 0 ]]; then
+      [[ $(grep -c 'qylock cutover attempt .* failed (exit 127)' "$tmp/waiter-failure.log") == 3 ]] ||
+        fail "deferred failure did not exhaust precisely three attempts"
+    fi
+  done
+done
 
 : >"$tmp/calls"
 WM_RELOAD_UNSUPPORTED=1 CUTOVER_LOG="$tmp/calls" CUTOVER_STATE="$tmp/state" \

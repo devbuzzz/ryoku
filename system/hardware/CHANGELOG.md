@@ -39,11 +39,13 @@
   transition through the existing cancellable policy and panel handoff. Other
   providers keep their native switch callbacks and never start the watcher.
   Covered by `tests/clamshell-policy.sh`.
-- **The lockscreen cutover waiter can no longer restart forever.** It ran the
-  staged helper under /run, which the cutover retires once it finishes, so a
-  waiter left behind failed every two seconds until the next reboot. It now
-  runs the installed helper, a new waiter replaces an old one, and login
-  clears any stale waiter (`power/ryoku-power-cutover`).
+- **The lockscreen cutover waiter has a bounded failure path.** The transient
+  must not restart after the three internal retries, which could otherwise
+  repeat desktop cutovers indefinitely. Scheduling now requires the installed
+  executable before stopping an old waiter; a missing one never falls back to
+  the /run staging copy. Final failure, including guard-acquisition failure,
+  attempts both qylock and session sleep-guard cleanup. Covered by
+  `tests/power-cutover.sh` (`power/ryoku-power-cutover`).
 - `gpu/ryoku-gpu`: **display-only DRM cards are no longer treated as render
   GPUs.** Ranking now requires a `device/drm/renderD*` node, so KMS-only
   devices such as the Touch Bar's `appletbdrm` never enter `AQ_DRM_DEVICES`.
